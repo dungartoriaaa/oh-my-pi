@@ -1,8 +1,39 @@
 /**
  * Read the Docs handler for web-fetch
  */
-import type { Element } from "@oh-my-pi/pi-utils/dom";
+import { type Element, parseHTML } from "@oh-my-pi/pi-utils/dom";
 import { buildResult, htmlToBasicMarkdown, loadPage, type RenderResult, type SpecialHandler } from "./types";
+
+/** Canonical raw URL, only when the repository ref identifies the documented version. */
+function versionedSourceUrl(href: string, version: string | undefined): string | null {
+	// RTD aliases do not identify a repository ref, even if a branch has the same name.
+	if (!version || version === "latest" || version === "stable") return null;
+	try {
+		const source = new URL(href);
+		if (source.protocol !== "https:" || source.username || source.password || source.port) return null;
+		let match: RegExpMatchArray | null;
+		if (source.hostname === "github.com") {
+			match = source.pathname.match(/^\/([^/]+\/[^/]+)\/(?:blob|edit|raw)\/([^/]+)\/(.+)$/);
+			if (!match || decodeURIComponent(match[2]) !== version) return null;
+			source.hostname = "raw.githubusercontent.com";
+			source.pathname = `/${match[1]}/${match[2]}/${match[3]}`;
+		} else if (source.hostname === "raw.githubusercontent.com") {
+			match = source.pathname.match(/^\/[^/]+\/[^/]+\/([^/]+)\/.+$/);
+			if (!match || decodeURIComponent(match[1]) !== version) return null;
+		} else if (source.hostname === "gitlab.com") {
+			match = source.pathname.match(/^\/(.+?\/-\/|[^/]+\/[^/]+\/)(?:blob|edit|raw)\/([^/]+)\/(.+)$/);
+			if (!match || decodeURIComponent(match[2]) !== version) return null;
+			source.pathname = `/${match[1]}raw/${match[2]}/${match[3]}`;
+		} else {
+			return null;
+		}
+		source.search = "";
+		source.hash = "";
+		return source.href;
+	} catch {
+		return null;
+	}
+}
 
 export const handleReadTheDocs: SpecialHandler = async (
 	url: string,
@@ -39,7 +70,6 @@ export const handleReadTheDocs: SpecialHandler = async (
 	}
 
 	// Parse HTML
-	const { parseHTML } = await import("@oh-my-pi/pi-utils/dom");
 	const root = parseHTML(result.content).document;
 
 	// Extract main content from common Read the Docs selectors
@@ -65,7 +95,15 @@ export const handleReadTheDocs: SpecialHandler = async (
 			el.remove();
 		});
 
-	// Try to find Edit on GitHub/GitLab links for raw source
+	// An Edit link can target main even on a release page. Require agreement with
+	// the built page's version, using the resolved URL for older pages without metadata.
+	const pathVersion = new URL(result.finalUrl).pathname.match(
+		/^\/(?:projects\/[^/]+\/)?[a-z]{2,3}(?:[-_][a-zA-Z0-9]+)*\/([^/]+)(?:\/|$)/,
+	)?.[1];
+	const metaVersion = root.querySelector('meta[name="readthedocs-version-slug"]')?.getAttribute("content")?.trim();
+	const version = metaVersion && pathVersion && metaVersion !== pathVersion ? undefined : metaVersion || pathVersion;
+
+	// Try to find a version-matched Edit on GitHub/GitLab link for raw source.
 	const editLinks = root.querySelectorAll('a[href*="github.com"], a[href*="gitlab.com"]');
 	let sourceUrl: string | null = null;
 
@@ -74,25 +112,30 @@ export const handleReadTheDocs: SpecialHandler = async (
 		const text = link.textContent?.toLowerCase() || "";
 
 		if (href && (text.includes("edit") || text.includes("source"))) {
-			// Convert edit URL to raw URL
-			if (href.includes("github.com")) {
-				sourceUrl = href.replace("/blob/", "/raw/").replace("/edit/", "/raw/");
-			} else if (href.includes("gitlab.com")) {
-				sourceUrl = href.replace("/blob/", "/raw/").replace("/edit/", "/raw/");
-			}
-			break;
+			sourceUrl = versionedSourceUrl(href, version);
+			if (sourceUrl) break;
 		}
 	}
 
 	let content = "";
+	let contentType = "text/html";
 
 	// Try to fetch raw source if available
 	if (sourceUrl) {
 		try {
 			const sourceResult = await loadPage(sourceUrl, { timeout: Math.min(timeout, 10), signal });
-			if (sourceResult.ok && sourceResult.content.length > 0 && sourceResult.content.length < 1_000_000) {
+			if (
+				sourceResult.ok &&
+				!sourceResult.truncated &&
+				sourceResult.contentType !== "text/html" &&
+				sourceResult.contentType !== "application/xhtml+xml" &&
+				sourceResult.content.length > 0 &&
+				sourceResult.content.length < 1_000_000 &&
+				versionedSourceUrl(sourceResult.finalUrl, version) === sourceUrl
+			) {
 				content = sourceResult.content;
-				notes.push(`Fetched raw source from ${sourceUrl}`);
+				contentType = "text/plain";
+				notes.push(`Fetched raw source from ${sourceResult.finalUrl}`);
 			}
 		} catch {
 			// Ignore errors, fall back to HTML
@@ -116,6 +159,6 @@ export const handleReadTheDocs: SpecialHandler = async (
 		method: "readthedocs",
 		fetchedAt,
 		notes,
-		contentType: sourceUrl ? "text/plain" : "text/html",
+		contentType,
 	});
 };
